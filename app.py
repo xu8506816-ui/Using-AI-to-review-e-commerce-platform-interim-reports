@@ -9,36 +9,52 @@ from ultralytics import YOLO
 KNIFE_KEYWORDS = [
     "刀", "小刀", "尖刀", "軍刀", "蝴蝶刀", "折疊刀", "匕首",
     "獵刀", "登山刀", "菜刀", "水管刀", "工兵刀", "砍刀",
-    "開山刀", "剃刀", "壓刀"
+    "開山刀", "剃刀", "壓刀",
 ]
 
 GUN_KEYWORDS = [
     "槍", "手槍", "步槍", "獵槍", "散彈槍", "突擊槍",
     "BB槍", "bb槍", "玩具槍", "模型槍", "仿真槍", "空氣槍",
-    "衝鋒槍", "狙擊槍", "水彈槍", "水槍"
+    "衝鋒槍", "狙擊槍", "水彈槍", "水槍",
 ]
 
 EN_KNIFE_KEYWORDS = [
-    "knife", "knives", "dagger", "blade", "machete",
-    "folding knife", "pocket knife", "hunting knife"
+    "knife",
+    "knives",
+    "dagger",
+    "blade",
+    "machete",
+    "folding knife",
+    "pocket knife",
+    "hunting knife",
 ]
 
 EN_GUN_KEYWORDS = [
-    "gun", "pistol", "rifle", "sniper", "shotgun",
-    "airsoft", "bb gun", "toy gun", "machine gun"
-]
-
-YOLO_DEFAULT_WEIGHTS = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
-YOLO_CONF_THRESHOLD = 0.25
-WEAPON_LABELS = {
-    "knife",
     "gun",
     "pistol",
     "rifle",
+    "sniper",
     "shotgun",
-    "revolver",
-    "firearm",
-    "weapon",
+    "airsoft",
+    "bb gun",
+    "toy gun",
+    "machine gun",
+]
+
+YOLO_DEFAULT_WEIGHTS = os.environ.get(
+    "YOLO_MODEL_PATH",
+    # 建議下載 https://github.com/JoaoAssalim/Weapons-and-Knives-Detector-with-YOLOv8 的 best.onnx
+    # 並放在專案下 weights/weapons-knives-best.onnx
+    "weights/weapons-knives-best.onnx",
+)
+YOLO_CONF_THRESHOLD = 0.25
+WEAPON_LABELS = {
+    # JoaoAssalim 模型只有兩類
+    "knife",
+    "gun",
+    # 允許大小寫／複數別名
+    "knives",
+    "guns",
 }
 
 
@@ -67,32 +83,29 @@ def analyze_text(text: str) -> Dict:
         if kw in text_lower:
             hit_guns.append(kw)
 
-    # 風險分數簡單設計：命中關鍵字就給較高基線
+    # 簡單風險分數：命中關鍵字就給較高基線
     score = 0.0
     if hit_knives or hit_guns:
-        # 有命中就 0.6 起跳，命中越多微調
         score = min(1.0, 0.6 + 0.1 * (len(hit_knives) + len(hit_guns)))
 
-    result = {
+    return {
         "score": score,
         "hit_knives": hit_knives,
         "hit_guns": hit_guns,
     }
-    return result
 
 
 # ======== 影像檢查邏輯（YOLOv8）========
 @st.cache_resource(show_spinner=False)
 def load_yolo_model(weights: str = YOLO_DEFAULT_WEIGHTS) -> YOLO:
-    # 用 cache 避免每次重複載入
     return YOLO(weights)
 
 
 def analyze_image(img: Image.Image) -> Dict:
     """
-    YOLOv8 影像檢查：
-    - 透過環境變數 `YOLO_MODEL_PATH` 指定權重，預設使用 coco 的 `yolov8n.pt`
-    - 若使用 coco 權重，武器類別較少；建議換成自訓或社群模型以提升槍械辨識
+    - 透過環境變數 `YOLO_MODEL_PATH` 指定權重，預設使用 weapons/knives 專案的 best.onnx
+    - 若未提供模型檔，請至 https://github.com/JoaoAssalim/Weapons-and-Knives-Detector-with-YOLOv8
+      下載 best.onnx，並放置於 weights/weapons-knives-best.onnx 或自行設置 `YOLO_MODEL_PATH`
     """
     if img is None:
         return {"score": 0.0, "labels": [], "debug": "尚未上傳圖片"}
@@ -132,13 +145,14 @@ def analyze_image(img: Image.Image) -> Dict:
         if name.lower() in WEAPON_LABELS:
             weapon_hits.append(label_text)
 
-    base_score = 0.1 * len(labels)
-    weapon_bonus = 0.35 * len(weapon_hits)
+    # 模型只有 knife/gun 兩類，命中時給較高權重
+    base_score = 0.05 * len(labels)
+    weapon_bonus = 0.5 * len(weapon_hits)
     score = min(1.0, base_score + weapon_bonus)
 
     debug = (
-        "目前使用 coco 權重；如需更強的槍械/武器偵測，"
-        "請改用自訓或社群 YOLO 權重並以環境變數 `YOLO_MODEL_PATH` 指定路徑"
+        "預設指向 weapons/knives 模型（best.onnx）；"
+        "若未下載請從專案取得，並以 `YOLO_MODEL_PATH` 或 weights/weapons-knives-best.onnx 指定路徑"
     )
 
     return {
@@ -152,10 +166,9 @@ def analyze_image(img: Image.Image) -> Dict:
 # ======== 總體風險合成 ========
 def combine_risk(text_score: float, image_score: float) -> float:
     """
-    簡單的合成方法：
-    - 假設 text / image 分數是 0~1
-    - 用 1 - (1 - a) * (1 - b) 的方式把兩個風險合併
-      （任何一邊高，最後就高）
+    簡單合成：
+    - text / image 分數 0~1
+    - 1 - (1 - a) * (1 - b)（任一高即拉高）
     """
     return 1 - (1 - text_score) * (1 - image_score)
 
@@ -212,7 +225,7 @@ def main():
         # 合併風險
         final_score = combine_risk(text_result["score"], image_result["score"])
 
-        # 顯示總覽
+        # 總覽
         st.subheader("總體風險評估")
         st.metric(
             label="風險分數（0~1）",
@@ -220,7 +233,7 @@ def main():
         )
         st.write("目前判定：", risk_level(final_score))
 
-        # 詳細說明區
+        # 詳細說明
         with st.expander("📄 詳細檢查說明", expanded=True):
             st.markdown("### 文字檢查結果")
             st.write(f"文字風險分數：**{text_result['score']:.2f}**")
@@ -244,8 +257,9 @@ def main():
             st.caption(image_result.get("debug", ""))
 
         st.info(
-            "YOLOv8 已啟用，預設使用 coco 權重 `yolov8n.pt`。"
-            "若需更佳槍械/刀具識別，請下載自訓或社群模型，並以環境變數 `YOLO_MODEL_PATH` 指定。"
+            "YOLOv8 已啟用，預設指向 Weapons-and-Knives-Detector-with-YOLOv8 的 ONNX 權重。"
+            "請從該專案下載 best.onnx，放到 weights/weapons-knives-best.onnx，"
+            "或以環境變數 `YOLO_MODEL_PATH` 指向你的模型路徑。"
         )
 
 
