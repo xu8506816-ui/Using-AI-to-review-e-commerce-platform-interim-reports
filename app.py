@@ -1,18 +1,21 @@
-import streamlit as st
-from PIL import Image
+import os
 from typing import Dict, List
 
-# ======== 規則：關鍵字清單（可以自己再慢慢擴充）========
+import streamlit as st
+from PIL import Image
+from ultralytics import YOLO
+
+# ======== 常見武器關鍵字（可自行增刪） ========
 KNIFE_KEYWORDS = [
-    "刀", "小刀", "匕首", "軍刀", "折疊刀", "摺疊刀", "折刀",
-    "瑞士刀", "開山刀", "砍刀", "水果刀", "工作刀", "獵刀",
-    "開刃", "刀具", "壓刃"
+    "刀", "小刀", "尖刀", "軍刀", "蝴蝶刀", "折疊刀", "匕首",
+    "獵刀", "登山刀", "菜刀", "水管刀", "工兵刀", "砍刀",
+    "開山刀", "剃刀", "壓刀"
 ]
 
 GUN_KEYWORDS = [
-    "槍", "手槍", "長槍", "步槍", "狙擊槍", "散彈槍", "霰彈槍",
-    "BB槍", "bb槍", "氣槍", "模型槍", "仿真槍", "空氣槍",
-    "衝鋒槍", "手拉槍", "水彈槍", "水彈"
+    "槍", "手槍", "步槍", "獵槍", "散彈槍", "突擊槍",
+    "BB槍", "bb槍", "玩具槍", "模型槍", "仿真槍", "空氣槍",
+    "衝鋒槍", "狙擊槍", "水彈槍", "水槍"
 ]
 
 EN_KNIFE_KEYWORDS = [
@@ -24,6 +27,19 @@ EN_GUN_KEYWORDS = [
     "gun", "pistol", "rifle", "sniper", "shotgun",
     "airsoft", "bb gun", "toy gun", "machine gun"
 ]
+
+YOLO_DEFAULT_WEIGHTS = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
+YOLO_CONF_THRESHOLD = 0.25
+WEAPON_LABELS = {
+    "knife",
+    "gun",
+    "pistol",
+    "rifle",
+    "shotgun",
+    "revolver",
+    "firearm",
+    "weapon",
+}
 
 
 # ======== 文字檢查邏輯 ========
@@ -51,10 +67,10 @@ def analyze_text(text: str) -> Dict:
         if kw in text_lower:
             hit_guns.append(kw)
 
-    # 風險分數簡單設計：有關鍵字就給比較高分
+    # 風險分數簡單設計：命中關鍵字就給較高基線
     score = 0.0
     if hit_knives or hit_guns:
-        # 有命中就 0.8 起跳，命中多一點可以再微調
+        # 有命中就 0.6 起跳，命中越多微調
         score = min(1.0, 0.6 + 0.1 * (len(hit_knives) + len(hit_guns)))
 
     result = {
@@ -65,29 +81,81 @@ def analyze_text(text: str) -> Dict:
     return result
 
 
-# ======== 圖像檢查邏輯（目前先做 placeholder）========
+# ======== 影像檢查邏輯（YOLOv8）========
+@st.cache_resource(show_spinner=False)
+def load_yolo_model(weights: str = YOLO_DEFAULT_WEIGHTS) -> YOLO:
+    # 用 cache 避免每次重複載入
+    return YOLO(weights)
+
+
 def analyze_image(img: Image.Image) -> Dict:
     """
-    這裡目前是示意用的規則：
-    - 真正實作時你可以把 YOLO / Detectron2 / 其他模型接進來
-    - 例如：讀取模型 → 推論 → 看有沒有 'knife', 'gun' 類別
+    YOLOv8 影像檢查：
+    - 透過環境變數 `YOLO_MODEL_PATH` 指定權重，預設使用 coco 的 `yolov8n.pt`
+    - 若使用 coco 權重，武器類別較少；建議換成自訓或社群模型以提升槍械辨識
     """
-    # 先回傳一個中立的結果，讓整個 app 可以跑
-    result = {
-        "score": 0.0,          # 0~1，之後你可以接模型結果
-        "labels": [],          # ['knife', 'gun'] ...
-        "debug": "尚未接上圖像模型，目前為示意結果"
+    if img is None:
+        return {"score": 0.0, "labels": [], "debug": "尚未上傳圖片"}
+
+    try:
+        model = load_yolo_model()
+    except Exception as exc:
+        return {
+            "score": 0.0,
+            "labels": [],
+            "debug": f"YOLO 載入或設定錯誤: {exc}",
+        }
+
+    results = model.predict(
+        img,
+        imgsz=640,
+        conf=YOLO_CONF_THRESHOLD,
+        verbose=False,
+    )
+
+    if not results:
+        return {"score": 0.0, "labels": [], "debug": "模型無輸出結果"}
+
+    res = results[0]
+    names = res.names
+    labels: List[str] = []
+    weapon_hits: List[str] = []
+
+    boxes = res.boxes
+    if boxes is None or boxes.cls is None or boxes.conf is None:
+        return {"score": 0.0, "labels": [], "debug": "模型無輸出結果"}
+
+    for cls_id, conf in zip(boxes.cls.tolist(), boxes.conf.tolist()):
+        name = names[int(cls_id)]
+        label_text = f"{name} ({conf:.2f})"
+        labels.append(label_text)
+        if name.lower() in WEAPON_LABELS:
+            weapon_hits.append(label_text)
+
+    base_score = 0.1 * len(labels)
+    weapon_bonus = 0.35 * len(weapon_hits)
+    score = min(1.0, base_score + weapon_bonus)
+
+    debug = (
+        "目前使用 coco 權重；如需更強的槍械/武器偵測，"
+        "請改用自訓或社群 YOLO 權重並以環境變數 `YOLO_MODEL_PATH` 指定路徑"
+    )
+
+    return {
+        "score": score,
+        "labels": labels,
+        "debug": debug,
+        "weapon_hits": weapon_hits,
     }
-    return result
 
 
-# ======== 最終風險整合 ========
+# ======== 總體風險合成 ========
 def combine_risk(text_score: float, image_score: float) -> float:
     """
-    簡單做一個融合方法：
-    - 假設 text / image 都是 0~1
+    簡單的合成方法：
+    - 假設 text / image 分數是 0~1
     - 用 1 - (1 - a) * (1 - b) 的方式把兩個風險合併
-      （任何一邊高，都會把整體風險拉高）
+      （任何一邊高，最後就高）
     """
     return 1 - (1 - text_score) * (1 - image_score)
 
@@ -96,17 +164,17 @@ def risk_level(score: float) -> str:
     if score >= 0.8:
         return "🚫 高風險（建議直接拒絕上架）"
     elif score >= 0.5:
-        return "⚠️ 中等風險（建議人工複審）"
+        return "⚠️ 中度風險（建議人工進一步審查）"
     else:
-        return "✅ 低風險（可以上架）"
+        return "✅ 低風險（可上架）"
 
 
 # ======== Streamlit UI ========
 def main():
-    st.set_page_config(page_title="違禁品審查系統", page_icon="🛡️", layout="centered")
+    st.set_page_config(page_title="電商違規審核系統", page_icon="🛡️", layout="centered")
 
-    st.title("🛡️ 電商違禁品審查 Demo（刀／槍枝）")
-    st.write("上傳商品圖片與文字，系統會進行 **刀具 / 槍枝** 相關風險檢查。")
+    st.title("🛡️ 電商違規審核 Demo（刀具／槍械）")
+    st.write("上傳商品圖片與文字，系統會進行 **刀具 / 槍械** 的風險檢查。")
 
     # 上傳區塊
     st.header("1️⃣ 上傳商品內容")
@@ -127,9 +195,9 @@ def main():
         title = st.text_input("商品標題", value="")
         description = st.text_area("商品描述 / 補充說明", height=150)
 
-    if st.button("🔍 開始違禁品檢查", type="primary"):
+    if st.button("🚀 開始違規審查", type="primary"):
         if not title and not description and uploaded_image is None:
-            st.warning("請至少提供文字或圖片再進行檢查。")
+            st.warning("請至少提供文字或圖片才能檢查。")
             return
 
         st.header("2️⃣ 檢查結果")
@@ -138,44 +206,47 @@ def main():
         full_text = (title or "") + "\n" + (description or "")
         text_result = analyze_text(full_text) if full_text.strip() else {"score": 0.0, "hit_knives": [], "hit_guns": []}
 
-        # 圖像檢查
-        image_result = analyze_image(img) if img is not None else {"score": 0.0, "labels": [], "debug": "未上傳圖片"}
+        # 影像檢查
+        image_result = analyze_image(img) if img is not None else {"score": 0.0, "labels": [], "debug": "尚未上傳圖片"}
 
-        # 整體風險
+        # 合併風險
         final_score = combine_risk(text_result["score"], image_result["score"])
 
-        # 顯示數值
-        st.subheader("整體風險評估")
+        # 顯示總覽
+        st.subheader("總體風險評估")
         st.metric(
-            label="風險分數（0～1）",
+            label="風險分數（0~1）",
             value=f"{final_score:.2f}"
         )
         st.write("目前判定：", risk_level(final_score))
 
-        # 詳細說明區塊
+        # 詳細說明區
         with st.expander("📄 詳細檢查說明", expanded=True):
             st.markdown("### 文字檢查結果")
             st.write(f"文字風險分數：**{text_result['score']:.2f}**")
 
             if text_result["hit_knives"]:
-                st.write("🔪 偵測到與 **刀具** 相關的關鍵字：")
-                st.write(", ".join(set(text_result["hit_knives"])))
+                st.write("🔪 命中 **刀具** 關鍵字：", ", ".join(set(text_result["hit_knives"])))
 
             if text_result["hit_guns"]:
-                st.write("🔫 偵測到與 **槍枝** 相關的關鍵字：")
-                st.write(", ".join(set(text_result["hit_guns"])))
+                st.write("🔫 命中 **槍械** 關鍵字：", ", ".join(set(text_result["hit_guns"])))
 
             if not text_result["hit_knives"] and not text_result["hit_guns"]:
-                st.write("✅ 文字內容中未偵測到明顯刀具／槍枝關鍵字。")
+                st.write("✅ 文字內容未檢出明顯刀具／槍械關鍵字。")
 
             st.markdown("---")
-            st.markdown("### 圖像檢查結果（目前為示意）")
-            st.write(f"圖像風險分數：**{image_result['score']:.2f}**")
+            st.markdown("### 影像檢查結果（YOLOv8）")
+            st.write(f"影像風險分數：**{image_result['score']:.2f}**")
+            if image_result.get("weapon_hits"):
+                st.write("⚠️ YOLO 命中 **刀具/槍械** 類別：", ", ".join(image_result["weapon_hits"]))
             if image_result.get("labels"):
-                st.write("偵測到疑似物件：", ", ".join(image_result["labels"]))
+                st.write("📌 模型偵測清單：", ", ".join(image_result["labels"]))
             st.caption(image_result.get("debug", ""))
 
-        st.info("⚙️ 提示：目前圖像部分只是範例，你可以把這裡接成 YOLO / Detectron2 / 其他模型的輸出。")
+        st.info(
+            "YOLOv8 已啟用，預設使用 coco 權重 `yolov8n.pt`。"
+            "若需更佳槍械/刀具識別，請下載自訓或社群模型，並以環境變數 `YOLO_MODEL_PATH` 指定。"
+        )
 
 
 if __name__ == "__main__":
