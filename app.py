@@ -1,8 +1,9 @@
-import os
-from typing import Dict, List
+﻿from typing import Dict, List, Optional
 
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
+import pytesseract
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 from ultralytics import YOLO
 
 # ======== 常見武器關鍵字（可自行增刪） ========
@@ -41,12 +42,7 @@ EN_GUN_KEYWORDS = [
     "machine gun",
 ]
 
-YOLO_DEFAULT_WEIGHTS = os.environ.get(
-    "YOLO_MODEL_PATH",
-    # 建議下載 https://github.com/JoaoAssalim/Weapons-and-Knives-Detector-with-YOLOv8 的 best.onnx
-    # 並放在專案下 weights/weapons-knives-best.onnx
-    "weights/weapons-knives-best.onnx",
-)
+YOLO_DEFAULT_WEIGHTS = "weights/weapons-knives-best.onnx"
 YOLO_CONF_THRESHOLD = 0.25
 WEAPON_LABELS = {
     # JoaoAssalim 模型只有兩類
@@ -57,15 +53,32 @@ WEAPON_LABELS = {
     "guns",
 }
 
+DEFAULT_TEXT_MODEL = "bert-base-chinese"
+DEFAULT_TEXT_MODEL_THRESHOLD = 0.5
+DEFAULT_TESS_LANG = "chi_tra+chi_sim+eng"
+DEFAULT_TESS_PSM = "6"
+DEFAULT_TESS_OEM = "3"
+DEFAULT_TESS_CMD = "C:\Program Files\Tesseract-OCR\\tesseract.exe"
 
-# ======== 文字檢查邏輯 ========
-def analyze_text(text: str) -> Dict:
+
+# ======== 文字檢查邏輯（BERT + 關鍵字混合） ========
+@st.cache_resource(show_spinner=False)
+def load_text_pipeline(model_path: str):
+    """
+    載入 transformers pipeline。
+    - 預設使用 bert-base-chinese；若無網路請先下載模型並用 UI 填寫本地路徑。
+    - 若載入失敗會在 analyze_text 內回退到關鍵字檢查。
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
+    return pipeline("text-classification", model=model, tokenizer=tokenizer, top_k=None)
+
+
+def keyword_hits(text: str) -> Dict[str, List[str]]:
     text_lower = text.lower()
-
     hit_knives: List[str] = []
     hit_guns: List[str] = []
 
-    # 中文關鍵字
     for kw in KNIFE_KEYWORDS:
         if kw in text:
             hit_knives.append(kw)
@@ -74,7 +87,6 @@ def analyze_text(text: str) -> Dict:
         if kw in text:
             hit_guns.append(kw)
 
-    # 英文關鍵字
     for kw in EN_KNIFE_KEYWORDS:
         if kw in text_lower:
             hit_knives.append(kw)
@@ -83,35 +95,66 @@ def analyze_text(text: str) -> Dict:
         if kw in text_lower:
             hit_guns.append(kw)
 
-    # 簡單風險分數：命中關鍵字就給較高基線
-    score = 0.0
-    if hit_knives or hit_guns:
-        score = min(1.0, 0.6 + 0.1 * (len(hit_knives) + len(hit_guns)))
+    return {"hit_knives": hit_knives, "hit_guns": hit_guns}
 
-    return {
-        "score": score,
-        "hit_knives": hit_knives,
-        "hit_guns": hit_guns,
-    }
+
+def analyze_text(text: str, model_path: str) -> Dict:
+    """
+    先嘗試 BERT 分類；若失敗則回退到關鍵字檢測。
+    需自行準備二分類模型（違規/正常），並以 model_path 指向。
+    模型輸出 label 包含 'positive'/'negative' 或 'violation'/'ok' 皆可。
+    """
+    hits = keyword_hits(text)
+    keyword_score = 0.0
+    if hits["hit_knives"] or hits["hit_guns"]:
+        keyword_score = min(1.0, 0.6 + 0.1 * (len(hits["hit_knives"]) + len(hits["hit_guns"])))
+
+    try:
+        clf = load_text_pipeline(model_path)
+        preds = clf(text)
+        # pipeline(top_k=None) 會回傳 list of list
+        first = preds[0][0] if preds and isinstance(preds[0], list) else preds[0]
+        label = first["label"].lower()
+        score = first["score"]
+        # 假設 label 包含 "viol" 或 "pos" 表示高風險；可依實際模型標籤調整
+        risk_from_model = score if ("viol" in label or "pos" in label) else (1 - score)
+        final_score = max(keyword_score, risk_from_model)
+        return {
+            "score": final_score,
+            "hit_knives": hits["hit_knives"],
+            "hit_guns": hits["hit_guns"],
+            "model_label": label,
+            "model_score": score,
+            "source": "bert",
+        }
+    except Exception as exc:
+        return {
+            "score": keyword_score,
+            "hit_knives": hits["hit_knives"],
+            "hit_guns": hits["hit_guns"],
+            "model_label": None,
+            "model_score": None,
+            "source": f"keyword_fallback ({exc})",
+        }
 
 
 # ======== 影像檢查邏輯（YOLOv8）========
 @st.cache_resource(show_spinner=False)
-def load_yolo_model(weights: str = YOLO_DEFAULT_WEIGHTS) -> YOLO:
+def load_yolo_model(weights: str) -> YOLO:
     return YOLO(weights)
 
 
-def analyze_image(img: Image.Image) -> Dict:
+def analyze_image(img: Image.Image, weights_path: str) -> Dict:
     """
-    - 透過環境變數 `YOLO_MODEL_PATH` 指定權重，預設使用 weapons/knives 專案的 best.onnx
+    - 權重路徑由 UI 設定（預設 weights/weapons-knives-best.onnx）
     - 若未提供模型檔，請至 https://github.com/JoaoAssalim/Weapons-and-Knives-Detector-with-YOLOv8
-      下載 best.onnx，並放置於 weights/weapons-knives-best.onnx 或自行設置 `YOLO_MODEL_PATH`
+      下載 best.onnx，並放置於 weights/weapons-knives-best.onnx 或在側邊設定中指定自訂路徑
     """
     if img is None:
         return {"score": 0.0, "labels": [], "debug": "尚未上傳圖片"}
 
     try:
-        model = load_yolo_model()
+        model = load_yolo_model(weights_path)
     except Exception as exc:
         return {
             "score": 0.0,
@@ -152,7 +195,7 @@ def analyze_image(img: Image.Image) -> Dict:
 
     debug = (
         "預設指向 weapons/knives 模型（best.onnx）；"
-        "若未下載請從專案取得，並以 `YOLO_MODEL_PATH` 或 weights/weapons-knives-best.onnx 指定路徑"
+        "若未下載請從專案取得，並在側邊設定中指定路徑"
     )
 
     return {
@@ -161,6 +204,45 @@ def analyze_image(img: Image.Image) -> Dict:
         "debug": debug,
         "weapon_hits": weapon_hits,
     }
+
+
+# ======== 圖片 OCR ========
+def prepare_ocr_image(img: Image.Image) -> Image.Image:
+    """簡單增強：灰階、自動對比、若過小則放大到寬度>=800。"""
+    gray = img.convert("L")
+    enhanced = ImageOps.autocontrast(gray)
+    if enhanced.width < 800:
+        ratio = 800 / enhanced.width
+        new_size = (int(enhanced.width * ratio), int(enhanced.height * ratio))
+        enhanced = enhanced.resize(new_size)
+    return enhanced
+
+
+def extract_text_from_image(
+    img: Image.Image,
+    tess_lang: str,
+    tess_psm: str,
+    tess_oem: str,
+    tess_cmd: str,
+) -> Dict[str, Optional[str]]:
+    """
+    使用 pytesseract 將圖片轉文字。
+    - 若系統未安裝 tesseract，請先安裝並確保可執行；可在 UI 指定執行檔路徑。
+    - 回傳 text 及 debug 訊息；失敗時 text 為空、debug 為錯誤訊息
+    """
+    try:
+        if tess_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tess_cmd
+        prepped = prepare_ocr_image(img)
+        config = f"--psm {tess_psm} --oem {tess_oem}"
+        text = pytesseract.image_to_string(prepped, lang=tess_lang, config=config)
+        debug_msg = (
+            f"pytesseract OCR (lang={tess_lang}, psm={tess_psm}, oem={tess_oem}); "
+            f"長度={len(text.strip())}"
+        )
+        return {"text": text.strip(), "debug": debug_msg}
+    except Exception as exc:
+        return {"text": "", "debug": f"OCR 失敗或未安裝 tesseract: {exc}"}
 
 
 # ======== 總體風險合成 ========
@@ -175,22 +257,30 @@ def combine_risk(text_score: float, image_score: float) -> float:
 
 def risk_level(score: float) -> str:
     if score >= 0.8:
-        return "🚫 高風險（建議直接拒絕上架）"
+        return "高風險（建議直接拒絕上架）"
     elif score >= 0.5:
-        return "⚠️ 中度風險（建議人工進一步審查）"
+        return "中度風險（建議人工進一步審查）"
     else:
-        return "✅ 低風險（可上架）"
-
+        return "低風險（可上架）"
 
 # ======== Streamlit UI ========
 def main():
-    st.set_page_config(page_title="電商違規審核系統", page_icon="🛡️", layout="centered")
+    st.set_page_config(page_title="電商違規審核系統", page_icon="shield", layout="centered")
 
-    st.title("🛡️ 電商違規審核 Demo（刀具／槍械）")
+    st.title("電商違規審核 Demo（刀具／槍械）")
     st.write("上傳商品圖片與文字，系統會進行 **刀具 / 槍械** 的風險檢查。")
 
-    # 上傳區塊
-    st.header("1️⃣ 上傳商品內容")
+    st.sidebar.header("檢測設定")
+    yolo_weights_path = st.sidebar.text_input("YOLO 權重路徑", value=YOLO_DEFAULT_WEIGHTS)
+    text_model_path = st.sidebar.text_input(
+        "文字分類模型（本地路徑或 Hugging Face 名稱）", value=DEFAULT_TEXT_MODEL
+    )
+    tess_lang = st.sidebar.text_input("OCR 語言", value=DEFAULT_TESS_LANG)
+    tess_psm = st.sidebar.text_input("OCR PSM", value=DEFAULT_TESS_PSM)
+    tess_oem = st.sidebar.text_input("OCR OEM", value=DEFAULT_TESS_OEM)
+    tess_cmd = st.sidebar.text_input("Tesseract 執行檔路徑（空則用 PATH）", value=DEFAULT_TESS_CMD)
+
+    st.header("步驟1：上傳商品內容")
 
     col1, col2 = st.columns(2)
 
@@ -208,35 +298,52 @@ def main():
         title = st.text_input("商品標題", value="")
         description = st.text_area("商品描述 / 補充說明", height=150)
 
-    if st.button("🚀 開始違規審查", type="primary"):
+    if st.button("開始違規審查", type="primary"):
         if not title and not description and uploaded_image is None:
             st.warning("請至少提供文字或圖片才能檢查。")
             return
 
-        st.header("2️⃣ 檢查結果")
+        st.header("步驟2：檢查結果")
 
-        # 文字檢查
+        ocr_text = ""
+        ocr_debug = ""
+        if img is not None:
+            ocr_result = extract_text_from_image(
+                img,
+                tess_lang=tess_lang,
+                tess_psm=tess_psm,
+                tess_oem=tess_oem,
+                tess_cmd=tess_cmd,
+            )
+            ocr_text = ocr_result.get("text", "")
+            ocr_debug = ocr_result.get("debug", "無 OCR 訊息")
+
         full_text = (title or "") + "\n" + (description or "")
-        text_result = analyze_text(full_text) if full_text.strip() else {"score": 0.0, "hit_knives": [], "hit_guns": []}
+        if ocr_text:
+            full_text += "\n" + ocr_text
+        text_result = (
+            analyze_text(full_text, model_path=text_model_path)
+            if full_text.strip()
+            else {"score": 0.0, "hit_knives": [], "hit_guns": []}
+        )
 
-        # 影像檢查
-        image_result = analyze_image(img) if img is not None else {"score": 0.0, "labels": [], "debug": "尚未上傳圖片"}
+        image_result = (
+            analyze_image(img, weights_path=yolo_weights_path)
+            if img is not None
+            else {"score": 0.0, "labels": [], "debug": "尚未上傳圖片"}
+        )
 
-        # 合併風險
         final_score = combine_risk(text_result["score"], image_result["score"])
 
-        # 總覽
         st.subheader("總體風險評估")
-        st.metric(
-            label="風險分數（0~1）",
-            value=f"{final_score:.2f}"
-        )
+        st.metric(label="風險分數（0~1）", value=f"{final_score:.2f}")
         st.write("目前判定：", risk_level(final_score))
 
-        # 詳細說明
-        with st.expander("📄 詳細檢查說明", expanded=True):
+        with st.expander("詳細檢查說明", expanded=True):
             st.markdown("### 文字檢查結果")
             st.write(f"文字風險分數：**{text_result['score']:.2f}**")
+            if text_result.get("model_label") is not None:
+                st.write(f"Transformers 來源：{text_result['source']}，label={text_result['model_label']}，score={text_result['model_score']}")
 
             if text_result["hit_knives"]:
                 st.write("🔪 命中 **刀具** 關鍵字：", ", ".join(set(text_result["hit_knives"])))
@@ -247,6 +354,12 @@ def main():
             if not text_result["hit_knives"] and not text_result["hit_guns"]:
                 st.write("✅ 文字內容未檢出明顯刀具／槍械關鍵字。")
 
+            if img is not None:
+                st.markdown("---")
+                st.markdown("### 圖片文字檢測（OCR）")
+                st.write(ocr_text if ocr_text.strip() else "（無有效文字）")
+                st.caption(ocr_debug or "OCR 完成")
+
             st.markdown("---")
             st.markdown("### 影像檢查結果（YOLOv8）")
             st.write(f"影像風險分數：**{image_result['score']:.2f}**")
@@ -256,10 +369,19 @@ def main():
                 st.write("📌 模型偵測清單：", ", ".join(image_result["labels"]))
             st.caption(image_result.get("debug", ""))
 
+        if img is not None:
+            st.markdown("### 圖片文字檢測結果")
+            st.write(ocr_text if ocr_text.strip() else "（無有效文字）")
+            st.caption(ocr_debug or "OCR 完成")
+
         st.info(
             "YOLOv8 已啟用，預設指向 Weapons-and-Knives-Detector-with-YOLOv8 的 ONNX 權重。"
             "請從該專案下載 best.onnx，放到 weights/weapons-knives-best.onnx，"
-            "或以環境變數 `YOLO_MODEL_PATH` 指向你的模型路徑。"
+            "或在左側設定中指定你的模型路徑。"
+        )
+        st.caption(
+            "文字辨識採 transformers BERT（預設 bert-base-chinese）；可在左側設定覆蓋。"
+            "若無法載入，會回退到關鍵字檢查。"
         )
 
 

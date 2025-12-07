@@ -2,3 +2,6 @@ streamlit
 pillow
 ultralytics
 onnxruntime
+transformers
+torch
+pytesseract
