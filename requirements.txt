@@ -5,3 +5,4 @@ onnxruntime
 transformers
 torch
 pytesseract
+easyocr

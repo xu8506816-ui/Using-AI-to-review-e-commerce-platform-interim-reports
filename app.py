@@ -2,7 +2,8 @@
 
 import streamlit as st
 from PIL import Image, ImageOps
-import pytesseract
+import easyocr
+import numpy as np
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 from ultralytics import YOLO
 
@@ -55,10 +56,7 @@ WEAPON_LABELS = {
 
 DEFAULT_TEXT_MODEL = "bert-base-chinese"
 DEFAULT_TEXT_MODEL_THRESHOLD = 0.5
-DEFAULT_TESS_LANG = "chi_tra+chi_sim+eng"
-DEFAULT_TESS_PSM = "6"
-DEFAULT_TESS_OEM = "3"
-DEFAULT_TESS_CMD = "C:\Program Files\Tesseract-OCR\\tesseract.exe"
+DEFAULT_OCR_LANGS = ["ch_tra", "en"]
 
 
 # ======== 文字檢查邏輯（BERT + 關鍵字混合） ========
@@ -206,7 +204,13 @@ def analyze_image(img: Image.Image, weights_path: str) -> Dict:
     }
 
 
-# ======== 圖片 OCR ========
+# ======== 圖片 OCR（EasyOCR） ========
+@st.cache_resource(show_spinner=False)
+def load_ocr_reader(langs: List[str]):
+    # EasyOCR reader 預設不開啟 GPU（如需可手動調整）
+    return easyocr.Reader(langs, gpu=False)
+
+
 def prepare_ocr_image(img: Image.Image) -> Image.Image:
     """簡單增強：灰階、自動對比、若過小則放大到寬度>=800。"""
     gray = img.convert("L")
@@ -220,29 +224,26 @@ def prepare_ocr_image(img: Image.Image) -> Image.Image:
 
 def extract_text_from_image(
     img: Image.Image,
-    tess_lang: str,
-    tess_psm: str,
-    tess_oem: str,
-    tess_cmd: str,
+    langs: List[str],
 ) -> Dict[str, Optional[str]]:
     """
-    使用 pytesseract 將圖片轉文字。
-    - 若系統未安裝 tesseract，請先安裝並確保可執行；可在 UI 指定執行檔路徑。
+    使用 EasyOCR 將圖片轉文字。
+    - 需先安裝 easyocr（requirements 已列）
     - 回傳 text 及 debug 訊息；失敗時 text 為空、debug 為錯誤訊息
     """
     try:
-        if tess_cmd:
-            pytesseract.pytesseract.tesseract_cmd = tess_cmd
         prepped = prepare_ocr_image(img)
-        config = f"--psm {tess_psm} --oem {tess_oem}"
-        text = pytesseract.image_to_string(prepped, lang=tess_lang, config=config)
+        reader = load_ocr_reader(langs)
+        # EasyOCR 需要 numpy 陣列
+        result = reader.readtext(np.array(prepped), detail=0)
+        text = "\n".join(result).strip()
         debug_msg = (
-            f"pytesseract OCR (lang={tess_lang}, psm={tess_psm}, oem={tess_oem}); "
-            f"長度={len(text.strip())}"
+            f"EasyOCR (lang={','.join(langs)})；"
+            f"行數={len(result)}，長度={len(text)}"
         )
         return {"text": text.strip(), "debug": debug_msg}
     except Exception as exc:
-        return {"text": "", "debug": f"OCR 失敗或未安裝 tesseract: {exc}"}
+        return {"text": "", "debug": f"OCR 失敗或未安裝 easyocr: {exc}"}
 
 
 # ======== 總體風險合成 ========
@@ -275,10 +276,17 @@ def main():
     text_model_path = st.sidebar.text_input(
         "文字分類模型（本地路徑或 Hugging Face 名稱）", value=DEFAULT_TEXT_MODEL
     )
-    tess_lang = st.sidebar.text_input("OCR 語言", value=DEFAULT_TESS_LANG)
-    tess_psm = st.sidebar.text_input("OCR PSM", value=DEFAULT_TESS_PSM)
-    tess_oem = st.sidebar.text_input("OCR OEM", value=DEFAULT_TESS_OEM)
-    tess_cmd = st.sidebar.text_input("Tesseract 執行檔路徑（空則用 PATH）", value=DEFAULT_TESS_CMD)
+    ocr_langs_input = st.sidebar.text_input(
+        "OCR 語言（逗號分隔，建議 ch_tra,en 或 ch_sim,en）",
+        value=",".join(DEFAULT_OCR_LANGS),
+    )
+    raw_langs = [lang.strip() for lang in ocr_langs_input.split(",") if lang.strip()]
+    # Chinese_tra / Chinese_sim 只能搭配英文，若用戶填多個非英文僅取第一個
+    ocr_langs = []
+    non_en = [l for l in raw_langs if l != "en"]
+    if non_en:
+        ocr_langs.append(non_en[0])
+    ocr_langs.append("en")
 
     st.header("步驟1：上傳商品內容")
 
@@ -310,10 +318,7 @@ def main():
         if img is not None:
             ocr_result = extract_text_from_image(
                 img,
-                tess_lang=tess_lang,
-                tess_psm=tess_psm,
-                tess_oem=tess_oem,
-                tess_cmd=tess_cmd,
+                langs=ocr_langs or DEFAULT_OCR_LANGS,
             )
             ocr_text = ocr_result.get("text", "")
             ocr_debug = ocr_result.get("debug", "無 OCR 訊息")
@@ -380,10 +385,12 @@ def main():
             "或在左側設定中指定你的模型路徑。"
         )
         st.caption(
-            "文字辨識採 transformers BERT（預設 bert-base-chinese）；可在左側設定覆蓋。"
-            "若無法載入，會回退到關鍵字檢查。"
+            "文字辨識改用 EasyOCR（預設語言 ch_sim,ch_tra,en），可在左側調整；"
+            "文字分類仍採 transformers BERT（預設 bert-base-chinese），可在左側覆蓋；"
+            "若模型載入失敗，會回退到關鍵字檢查。"
         )
 
 
 if __name__ == "__main__":
     main()
+
