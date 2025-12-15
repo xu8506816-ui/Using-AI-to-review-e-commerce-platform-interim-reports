@@ -6,3 +6,5 @@ transformers
 torch
 pytesseract
 easyocr
+requests
+beautifulsoup4

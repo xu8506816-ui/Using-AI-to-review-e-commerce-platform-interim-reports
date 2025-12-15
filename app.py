@@ -1,9 +1,13 @@
-﻿from typing import Dict, List, Optional
+﻿from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 from PIL import Image, ImageOps
 import easyocr
+from io import BytesIO
+from urllib.parse import urljoin
 import numpy as np
+import requests
+from bs4 import BeautifulSoup
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
 from ultralytics import YOLO
 
@@ -134,6 +138,52 @@ def analyze_text(text: str, model_path: str) -> Dict:
             "model_score": None,
             "source": f"keyword_fallback ({exc})",
         }
+
+
+# ======== 網頁文字擷取 ========
+def fetch_url_text(url: str) -> Dict[str, Optional[str]]:
+    """
+    抓取網頁文字做檢測。僅擷取 <body> 文字，移除 script/style。
+    會回傳 text、images（網址列表）與 debug 訊息。
+    """
+    try:
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.extract()
+        text = soup.get_text(separator="\n")
+        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+        # 限制長度，避免過長
+        max_len = 8000
+        if len(text) > max_len:
+            text = text[:max_len]
+        # 收集圖片連結
+        imgs: List[str] = []
+        for img_tag in soup.find_all("img"):
+            src = img_tag.get("src")
+            if not src:
+                continue
+            full = urljoin(resp.url, src)
+            imgs.append(full)
+        return {"text": text, "images": imgs, "debug": f"成功抓取文字，長度 {len(text)}，圖片 {len(imgs)} 張"}
+    except Exception as exc:
+        return {"text": "", "images": [], "debug": f"無法抓取網址內容: {exc}"}
+
+
+def download_images(urls: List[str], limit: int = 5) -> Tuple[List[Image.Image], List[str]]:
+    images: List[Image.Image] = []
+    debug_msgs: List[str] = []
+    for url in urls[:limit]:
+        try:
+            r = requests.get(url, timeout=6)
+            r.raise_for_status()
+            img = Image.open(BytesIO(r.content)).convert("RGB")
+            images.append(img)
+            debug_msgs.append(f"OK: {url}")
+        except Exception as exc:
+            debug_msgs.append(f"FAIL: {url} ({exc})")
+    return images, debug_msgs
 
 
 # ======== 影像檢查邏輯（YOLOv8）========
@@ -288,25 +338,40 @@ def main():
         ocr_langs.append(non_en[0])
     ocr_langs.append("en")
 
-    st.header("步驟1：上傳商品內容")
+    mode = st.radio("選擇檢測模式", ["上傳檔案", "網址檢測"], horizontal=True)
 
-    col1, col2 = st.columns(2)
+    img = None
+    title = ""
+    description = ""
+    url_input = ""
 
-    with col1:
-        uploaded_image = st.file_uploader(
-            "上傳商品圖片（jpg / png）",
-            type=["jpg", "jpeg", "png"]
-        )
-        img = None
-        if uploaded_image is not None:
-            img = Image.open(uploaded_image).convert("RGB")
-            st.image(img, caption="商品圖片預覽", use_column_width=True)
+    if mode == "上傳檔案":
+        st.header("步驟1：上傳商品內容")
+        col1, col2 = st.columns(2)
 
-    with col2:
-        title = st.text_input("商品標題", value="")
-        description = st.text_area("商品描述 / 補充說明", height=150)
+        with col1:
+            uploaded_image = st.file_uploader(
+                "上傳商品圖片（jpg / png）",
+                type=["jpg", "jpeg", "png"]
+            )
+            if uploaded_image is not None:
+                img = Image.open(uploaded_image).convert("RGB")
+                st.image(img, caption="商品圖片預覽", use_column_width=True)
 
-    if st.button("開始違規審查", type="primary"):
+        with col2:
+            title = st.text_input("商品標題", value="")
+            description = st.text_area("商品描述 / 補充說明", height=150)
+
+        run_upload_check = st.button("開始違規審查", type="primary")
+        run_url_check = False
+
+    else:
+        st.header("步驟1：輸入商品頁網址")
+        url_input = st.text_input("商品頁網址", value="")
+        run_url_check = st.button("檢查網址內容", type="primary")
+        run_upload_check = False
+
+    if run_upload_check:
         if not title and not description and uploaded_image is None:
             st.warning("請至少提供文字或圖片才能檢查。")
             return
@@ -390,7 +455,70 @@ def main():
             "若模型載入失敗，會回退到關鍵字檢查。"
         )
 
+    if run_url_check:
+        if not url_input.strip():
+            st.warning("請輸入網址再檢查。")
+            return
+
+        st.header("步驟2：網址檢查結果")
+        fetch_res = fetch_url_text(url_input.strip())
+        page_text = fetch_res.get("text", "")
+        page_images = fetch_res.get("images", [])
+        debug_info = fetch_res.get("debug", "")
+        if not page_text:
+            st.error(f"抓取失敗：{debug_info}")
+            return
+
+        text_result = analyze_text(page_text, model_path=text_model_path)
+        # 下載部分圖片並跑 YOLO
+        dl_images, img_debugs = download_images(page_images, limit=5)
+        image_scores: List[float] = []
+        image_hits: List[str] = []
+        image_labels: List[str] = []
+        for img in dl_images:
+            res = analyze_image(img, weights_path=yolo_weights_path)
+            image_scores.append(res["score"])
+            image_hits.extend(res.get("weapon_hits", []))
+            image_labels.extend(res.get("labels", []))
+        image_score = max(image_scores) if image_scores else 0.0
+        final_score = combine_risk(text_result["score"], image_score)
+
+        st.subheader("文字檢查")
+        st.write(f"文字風險分數：**{text_result['score']:.2f}**")
+        if text_result.get("model_label") is not None:
+            st.write(f"Transformers 來源：{text_result['source']}，label={text_result['model_label']}，score={text_result['model_score']}")
+        if text_result["hit_knives"]:
+            st.write("🔪 命中 **刀具** 關鍵字：", ", ".join(set(text_result["hit_knives"])))
+        if text_result["hit_guns"]:
+            st.write("🔫 命中 **槍械** 關鍵字：", ", ".join(set(text_result["hit_guns"])))
+        if not text_result["hit_knives"] and not text_result["hit_guns"]:
+            st.write("✅ 文字內容未檢出明顯刀具／槍械關鍵字。")
+
+        st.markdown("### 圖片檢查（從網址抓取）")
+        if dl_images:
+            st.write(f"下載圖片 {len(dl_images)} 張，YOLO 最高分：**{image_score:.2f}**")
+            if image_hits:
+                st.write("⚠️ 命中 **刀具/槍械** 類別：", ", ".join(image_hits))
+            if image_labels:
+                st.write("📌 偵測清單：", ", ".join(image_labels))
+            with st.expander("下載/偵測紀錄", expanded=False):
+                st.write("\n".join(img_debugs))
+        else:
+            st.write("（此頁未成功抓取或下載圖片）")
+
+        st.markdown("### 綜合風險（文字+圖片）")
+        st.metric("風險分數（0~1）", f"{final_score:.2f}")
+        st.write("目前判定：", risk_level(final_score))
+
+        st.markdown("---")
+        st.markdown("### 抓取的頁面文字（節錄）")
+        st.caption(debug_info)
+        st.write(page_text[:2000] + ("..." if len(page_text) > 2000 else ""))
+
 
 if __name__ == "__main__":
     main()
+
+
+
 
