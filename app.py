@@ -4,7 +4,7 @@ import streamlit as st
 from PIL import Image, ImageOps
 import easyocr
 from io import BytesIO
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
@@ -141,13 +141,13 @@ def analyze_text(text: str, model_path: str) -> Dict:
 
 
 # ======== 網頁文字擷取 ========
-def fetch_url_text(url: str) -> Dict[str, Optional[str]]:
+def fetch_url_text(url: str, timeout: int = 8) -> Dict[str, Optional[str]]:
     """
     抓取網頁文字做檢測。僅擷取 <body> 文字，移除 script/style。
     會回傳 text、images（網址列表）與 debug 訊息。
     """
     try:
-        resp = requests.get(url, timeout=8)
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style", "noscript"]):
@@ -161,7 +161,9 @@ def fetch_url_text(url: str) -> Dict[str, Optional[str]]:
         # 收集圖片連結
         imgs: List[str] = []
         for img_tag in soup.find_all("img"):
-            src = img_tag.get("src")
+            src = img_tag.get("src") or img_tag.get("data-src") or ""
+            if not src and img_tag.get("srcset"):
+                src = img_tag.get("srcset").split(",")[0].split()[0]
             if not src:
                 continue
             full = urljoin(resp.url, src)
@@ -171,14 +173,73 @@ def fetch_url_text(url: str) -> Dict[str, Optional[str]]:
         return {"text": "", "images": [], "debug": f"無法抓取網址內容: {exc}"}
 
 
+def fetch_url_page(url: str, timeout: int = 30) -> Dict[str, Optional[str]]:
+    """
+    抓取頁面文字、圖片與同網域連結。
+    """
+    try:
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.extract()
+        text = soup.get_text(separator="\n")
+        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+        if len(text) > 8000:
+            text = text[:8000]
+
+        imgs: List[str] = []
+        for img_tag in soup.find_all("img"):
+            src = img_tag.get("src") or img_tag.get("data-src") or ""
+            if not src and img_tag.get("srcset"):
+                src = img_tag.get("srcset").split(",")[0].split()[0]
+            if not src:
+                continue
+            imgs.append(urljoin(resp.url, src))
+
+        links: List[str] = []
+        for a in soup.find_all("a"):
+            href = a.get("href")
+            if not href:
+                continue
+            links.append(urljoin(resp.url, href))
+
+        return {
+            "text": text,
+            "images": imgs,
+            "links": links,
+            "debug": f"成功抓取頁面：文字 {len(text)}，圖片 {len(imgs)}，連結 {len(links)}",
+        }
+    except Exception as exc:
+        return {"text": "", "images": [], "links": [], "debug": f"抓取失敗: {exc}"}
+
+
+def is_same_domain(base: str, target: str) -> bool:
+    return urlparse(base).netloc == urlparse(target).netloc
+
+
+def is_excluded_path(url: str, exclude_paths: List[str]) -> bool:
+    path = urlparse(url).path.lower()
+    return any(path.startswith(p) for p in exclude_paths)
+
+
 def download_images(urls: List[str], limit: int = 5) -> Tuple[List[Image.Image], List[str]]:
     images: List[Image.Image] = []
     debug_msgs: List[str] = []
+    max_bytes = 5 * 1024 * 1024
     for url in urls[:limit]:
         try:
-            r = requests.get(url, timeout=6)
+            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"}, stream=True)
             r.raise_for_status()
-            img = Image.open(BytesIO(r.content)).convert("RGB")
+            ctype = r.headers.get("Content-Type", "")
+            if "image" not in ctype:
+                debug_msgs.append(f"SKIP非圖片: {url}")
+                continue
+            raw = r.content
+            if len(raw) > max_bytes:
+                debug_msgs.append(f"SKIP過大: {url}")
+                continue
+            img = Image.open(BytesIO(raw)).convert("RGB")
             images.append(img)
             debug_msgs.append(f"OK: {url}")
         except Exception as exc:
@@ -338,7 +399,7 @@ def main():
         ocr_langs.append(non_en[0])
     ocr_langs.append("en")
 
-    mode = st.radio("選擇檢測模式", ["上傳檔案", "網址檢測"], horizontal=True)
+    mode = st.radio("選擇檢測模式", ["上傳檔案", "網址檢測", "深度網址檢測"], horizontal=True)
 
     img = None
     title = ""
@@ -365,11 +426,22 @@ def main():
         run_upload_check = st.button("開始違規審查", type="primary")
         run_url_check = False
 
-    else:
+    elif mode == "網址檢測":
         st.header("步驟1：輸入商品頁網址")
         url_input = st.text_input("商品頁網址", value="")
         run_url_check = st.button("檢查網址內容", type="primary")
         run_upload_check = False
+        run_deep_check = False
+
+    else:
+        st.header("步驟1：深度網址檢測")
+        url_input = st.text_input("網站起始網址", value="")
+        exclude_input = st.text_input("排除路徑（逗號分隔）", value="/login,/cart,/checkout")
+        max_pages = st.number_input("最大頁數", min_value=1, max_value=100, value=20, step=1)
+        max_depth = st.number_input("最大深度", min_value=0, max_value=5, value=2, step=1)
+        run_deep_check = st.button("開始深度網址檢測", type="primary")
+        run_upload_check = False
+        run_url_check = False
 
     if run_upload_check:
         if not title and not description and uploaded_image is None:
@@ -514,6 +586,77 @@ def main():
         st.markdown("### 抓取的頁面文字（節錄）")
         st.caption(debug_info)
         st.write(page_text[:2000] + ("..." if len(page_text) > 2000 else ""))
+
+    if run_deep_check:
+        if not url_input.strip():
+            st.warning("請輸入網站起始網址。")
+            return
+
+        base_url = url_input.strip()
+        exclude_paths = [p.strip().lower() for p in exclude_input.split(",") if p.strip()]
+        max_pages_int = int(max_pages)
+        max_depth_int = int(max_depth)
+
+        st.header("步驟2：深度網址檢測結果")
+        queue: List[Tuple[str, int]] = [(base_url, 0)]
+        visited: set[str] = set()
+        results: List[Dict[str, Optional[str]]] = []
+        progress = st.progress(0)
+
+        while queue and len(visited) < max_pages_int:
+            current_url, depth = queue.pop(0)
+            if current_url in visited:
+                continue
+            if not is_same_domain(base_url, current_url):
+                continue
+            if is_excluded_path(current_url, exclude_paths):
+                continue
+            visited.add(current_url)
+
+            page_res = fetch_url_page(current_url, timeout=30)
+            page_text = page_res.get("text", "")
+            page_images = page_res.get("images", [])
+            page_links = page_res.get("links", [])
+
+            text_result = analyze_text(page_text, model_path=text_model_path) if page_text else {"score": 0.0, "hit_knives": [], "hit_guns": []}
+            dl_images, _ = download_images(page_images, limit=3)
+            image_scores: List[float] = []
+            image_hits: List[str] = []
+            for img in dl_images:
+                res = analyze_image(img, weights_path=yolo_weights_path)
+                image_scores.append(res["score"])
+                image_hits.extend(res.get("weapon_hits", []))
+            image_score = max(image_scores) if image_scores else 0.0
+            final_score = combine_risk(text_result["score"], image_score)
+
+            results.append({
+                "url": current_url,
+                "text_score": f"{text_result['score']:.2f}",
+                "image_score": f"{image_score:.2f}",
+                "final_score": f"{final_score:.2f}",
+                "hits": ", ".join(set(text_result.get("hit_knives", []) + text_result.get("hit_guns", []))),
+                "image_hits": ", ".join(set(image_hits)),
+            })
+
+            if depth < max_depth_int:
+                for link in page_links:
+                    if link in visited:
+                        continue
+                    if not is_same_domain(base_url, link):
+                        continue
+                    if is_excluded_path(link, exclude_paths):
+                        continue
+                    queue.append((link, depth + 1))
+
+            progress.progress(min(1.0, len(visited) / max_pages_int))
+
+        st.subheader("掃描摘要")
+        st.write(f"已掃描 {len(visited)} 頁，深度上限 {max_depth_int}。")
+
+        if results:
+            st.dataframe(results)
+        else:
+            st.write("（沒有可用的掃描結果）")
 
 
 if __name__ == "__main__":
