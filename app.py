@@ -405,6 +405,9 @@ def main():
     title = ""
     description = ""
     url_input = ""
+    run_upload_check = False
+    run_url_check = False
+    run_deep_check = False
 
     if mode == "上傳檔案":
         st.header("步驟1：上傳商品內容")
