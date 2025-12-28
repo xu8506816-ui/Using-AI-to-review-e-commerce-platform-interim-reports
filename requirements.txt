@@ -6,5 +6,6 @@ transformers
 torch
 pytesseract
 easyocr
+opencv-python-headless
 requests
 beautifulsoup4
